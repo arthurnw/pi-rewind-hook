@@ -513,6 +513,57 @@ test("rewind:checkpoint-entry binds the current tree to a custom message", async
   }
 });
 
+test("rewind:checkpoint-entry is a no-op after session_shutdown", async () => {
+  // Regression: previously the rewind:checkpoint-entry handler captured the
+  // session’s ctx in a module-scoped activeContext and never released it on
+  // shutdown. A late event would call ctx.hasUI on a deactivated runner via
+  // notify()/updateStatus() and throw. After shutdown, activeContext must be
+  // cleared so the handler bails at `if (!ctx) return`.
+  const harness = await createHarness({
+    settings: { rewind: { silentCheckpoints: true } },
+  });
+
+  try {
+    harness.currentSession.replaceEntries([
+      {
+        type: "custom_message",
+        id: "marker-1",
+        parentId: null,
+        timestamp: new Date().toISOString(),
+        customType: "pi-custom-compaction.virtual-summary-marker",
+        content: "Older context was summarized in the background.",
+        display: true,
+      },
+    ]);
+
+    await harness.invoke("session_start", {});
+    await harness.invoke("session_shutdown", {});
+
+    const handler = harness.eventHandlers.get("rewind:checkpoint-entry");
+    assert.ok(handler, "rewind:checkpoint-entry handler should be registered");
+
+    // Should not throw, and should not record a checkpoint (because activeContext
+    // is cleared, so the handler bails before calling checkpointEntry).
+    await assert.doesNotReject(async () => {
+      await handler({ source: "pi-custom-compaction", entryId: "marker-1" });
+      // 750ms gives the dangling git ops (ensureSnapshotForCurrentWorktree
+      // + appendRewindOp) enough time to actually complete.
+      await new Promise((resolve) => setTimeout(resolve, 750));
+    });
+
+    // No rewind-op entry should have been appended for marker-1.
+    const entries = harness.currentSession.getEntries();
+    const checkpointed = entries.some(
+      (entry) =>
+        entry.customType === "rewind-op" &&
+        Array.isArray((entry.data as { bindings?: unknown[] })?.bindings),
+    );
+    assert.equal(checkpointed, false, "no checkpoint should be recorded after shutdown");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("session_before_tree auto-keeps current files during boomerang collapse", async () => {
   const harness = await createHarness({
     settings: { rewind: { silentCheckpoints: true } },

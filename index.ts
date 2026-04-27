@@ -393,24 +393,36 @@ export default function rewindExtension(pi: ExtensionAPI) {
   let forceConversationOnlySource: string | null = null;
 
   function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error" = "info") {
-    if (!ctx.hasUI) return;
-    if (level === "info" && getSilentCheckpointsSetting()) return;
-    ctx.ui.notify(message, level);
+    // Guard against stale contexts: dangling background promises (e.g. retention
+    // sweeps, rewind:checkpoint-entry handlers) can resolve after session_shutdown,
+    // at which point ctx.hasUI throws because the runner has been deactivated.
+    // Silently dropping a UI side effect on a dead context is the correct behavior.
+    try {
+      if (!ctx.hasUI) return;
+      if (level === "info" && getSilentCheckpointsSetting()) return;
+      ctx.ui.notify(message, level);
+    } catch {
+      // Stale context after shutdown; nothing to surface.
+    }
   }
 
   function updateStatus(ctx: ExtensionContext) {
-    if (!ctx.hasUI) return;
-    if (!isGitRepo || getSilentCheckpointsSetting()) {
-      ctx.ui.setStatus(STATUS_KEY, undefined);
-      return;
-    }
+    try {
+      if (!ctx.hasUI) return;
+      if (!isGitRepo || getSilentCheckpointsSetting()) {
+        ctx.ui.setStatus(STATUS_KEY, undefined);
+        return;
+      }
 
-    const uniqueSnapshots = new Set(entryToCommit.values()).size;
-    const theme = ctx.ui.theme;
-    ctx.ui.setStatus(
-      STATUS_KEY,
-      theme.fg("dim", "◆ ") + theme.fg("muted", `${entryToCommit.size} points / ${uniqueSnapshots} snapshots`),
-    );
+      const uniqueSnapshots = new Set(entryToCommit.values()).size;
+      const theme = ctx.ui.theme;
+      ctx.ui.setStatus(
+        STATUS_KEY,
+        theme.fg("dim", "◆ ") + theme.fg("muted", `${entryToCommit.size} points / ${uniqueSnapshots} snapshots`),
+      );
+    } catch {
+      // Stale context after shutdown; status updates are pure side effects.
+    }
   }
 
   function resetState() {
@@ -1234,8 +1246,20 @@ export default function rewindExtension(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (_event, ctx) => {
     syncSessionIdentity(ctx);
-    if (!isGitRepo) return;
-    await maybeSweepRetention(ctx, "shutdown");
+    try {
+      if (!isGitRepo) return;
+      await maybeSweepRetention(ctx, "shutdown");
+    } finally {
+      // Clear the captured context so post-shutdown events (e.g. a late
+      // rewind:checkpoint-entry) bail at the `if (!ctx) return` guard instead
+      // of operating on a deactivated runner. Each pi event gets a fresh ctx
+      // from runner.createContext(), so an identity check against `ctx` would
+      // never match the activeContext captured at session_start; clear it
+      // unconditionally. Pi's session lifecycle is sequential (shutdown of
+      // the current session completes before the next session_start fires),
+      // so this cannot clobber a concurrent session's context.
+      activeContext = undefined;
+    }
   });
 
   pi.on("turn_start", async (event, ctx) => {
